@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include "userprog/gdt.h"
 #include "userprog/pagedir.h"
 #include "userprog/tss.h"
@@ -15,6 +16,7 @@
 #include "threads/init.h"
 #include "threads/interrupt.h"
 #include "threads/palloc.h"
+#include "threads/malloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 
@@ -25,6 +27,40 @@
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
 
+static struct lock index_lock;
+static int current_index;
+static int next_index;
+
+void process_init(void) {
+	struct thread *cur = thread_current();
+	
+	for(int i = 0; i < 128; i += 1) {
+		process_list[i].pid = 0;
+		process_list[i].parent_pid = 0;
+		process_list[i].parent_index = 0;
+		process_list[i].exit_status = 0;
+		process_list[i].exception_flag = 0;
+		sema_init(&process_list[i].wait_sema, 0);
+		sema_init(&process_list[i].load_sema, 0);
+		sema_init(&process_list[i].exec_sema, 0);
+	}
+	
+	process_list[0].pid = cur->tid; // pid of pintos kernel
+	process_list[0].t = cur;
+	cur->pid_index = 0;
+	cur->exit_message_flag = 1;
+	current_index = 0;
+	next_index = 1;
+	
+	/* Initialize kernel's files so all processes have access to these files */
+	for(int i = 0; i < 50; i += 1) {
+		process_list[0].t->files[i] = 0;
+	}
+	process_list[0].t->next_fd = 2;
+	
+	lock_init(&index_lock);
+}
+
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
    before process_execute() returns.  Returns the new process's
@@ -32,8 +68,32 @@ static bool load (const char *cmdline, void (**eip) (void), void **esp);
 tid_t
 process_execute (const char *file_name)
 {
+	struct thread *cur = thread_current();
+	
+	lock_acquire(&index_lock);
+	
+	current_index = next_index;
+	next_index += 1;
+	
+	lock_release(&index_lock);
+	
+	process_list[current_index].parent_pid = cur->tid;
+	process_list[current_index].parent_index = cur->pid_index;
+	
   char *fn_copy;
   tid_t tid;
+
+	char *dummy;
+  char *name = (char*) malloc(strlen(file_name) + 1);
+	if(name == NULL) {
+		return TID_ERROR;
+	}
+
+	strlcpy(name, file_name, PGSIZE);
+	name = strtok_r(name, " ", &dummy);
+	if(name == NULL) {
+		return TID_ERROR;
+	}
 
   // NOTE:
   // To see this print, make sure LOGGING_LEVEL in this file is <= L_TRACE (6)
@@ -49,9 +109,17 @@ process_execute (const char *file_name)
   strlcpy (fn_copy, file_name, PGSIZE);
 
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
+  tid = thread_create (name, PRI_DEFAULT, start_process, fn_copy);
   if (tid == TID_ERROR)
     palloc_free_page (fn_copy);
+
+	sema_down(&process_list[current_index].load_sema);
+	
+	if(process_list[current_index].pid == -1) {
+		tid = -1;
+	}
+
+	free(name);
   return tid;
 }
 
@@ -60,7 +128,15 @@ process_execute (const char *file_name)
 static void
 start_process (void *file_name_)
 {
-  char *file_name = file_name_;
+	struct thread *cur = thread_current();
+	cur->pid_index = current_index;
+	process_list[current_index].t = cur;
+	int args_length = strlen(file_name_) + 1;
+	char *args = (char*) malloc(args_length);
+	ASSERT(args != NULL);
+	strlcpy(args, file_name_, args_length);
+	char *remaining, *token;
+  char *file_name = strtok_r(file_name_, " ", &remaining);
   struct intr_frame if_;
   bool success;
 
@@ -72,10 +148,75 @@ start_process (void *file_name_)
   success = load (file_name, &if_.eip, &if_.esp);
 
   /* If load failed, quit. */
-  palloc_free_page (file_name);
-  if (!success)
+  if (!success) {
+		palloc_free_page (file_name);
+		process_list[cur->pid_index].pid = -1;
+		process_list[cur->pid_index].t->exit_status = -1;
+		process_list[cur->pid_index].t->exit_message_flag = 0;
+		sema_up(&process_list[cur->pid_index].load_sema);
     thread_exit ();
+	} else {
+		process_list[cur->pid_index].pid = cur->tid;
+	}
+	
+	/* Successfully loaded executable, so deny writes to it */
+	struct file *f = filesys_open(file_name);
+	file_deny_write(f);
+	process_list[0].t->files[process_list[0].t->next_fd] = f;
+	process_list[0].t->next_fd += 1;
 
+	/* Set up argv and argc for new executable. */
+	char **argv;
+	int argc = 1; // one already for exec name
+
+	/* Need to know number of arguments before malloc-ing
+	   argv and setting argc */
+	while((token = strtok_r(NULL, " ", &remaining)) != NULL) {
+		argc += 1;
+	}
+	
+	argv = (char**) malloc((argc + 1) * sizeof(char*));
+	ASSERT(argv != NULL);
+	
+	for(int i = 0; i < argc; i += 1) {
+		if(i == 0) {
+			token = strtok_r(args, " ", &remaining);
+		} else {
+			token = strtok_r(NULL, " ", &remaining);
+		}
+		
+		// push args on stack
+		if_.esp -= (strlen(token) + 1);
+		memcpy(if_.esp, token, strlen(token) + 1);
+		argv[i] = if_.esp;
+	}
+	
+	/* Make word-aligned for faster accesses */
+	if_.esp -= ((uintptr_t)if_.esp % 4);
+	
+	/* Push addresses of arguments in argv */
+	argv[argc] = NULL;
+	if_.esp -= ((argc + 1) * sizeof(char*));
+	memcpy(if_.esp, &argv[0], ((argc + 1) * sizeof(char*)));
+	
+	/* Push argv and argc on stack */
+	uintptr_t argv_address = (uintptr_t)if_.esp;
+	if_.esp -= sizeof(char**);
+	memcpy(if_.esp, &argv_address, sizeof(char*));
+	if_.esp -= sizeof(int);
+	*((char*)if_.esp) = argc;
+	
+	/* Push dummy return address */
+	if_.esp -= sizeof(void*);
+	*((char*)if_.esp) = 0;
+
+	palloc_free_page (file_name);
+	free(argv);
+	free(args);
+	
+	sema_up(&process_list[cur->pid_index].load_sema);
+	
+	//hex_dump(0, if_.esp, (PHYS_BASE-if_.esp), true);
   /* Start the user process by simulating a return from an
      interrupt, implemented by intr_exit (in
      threads/intr-stubs.S).  Because intr_exit takes all of its
@@ -98,7 +239,24 @@ start_process (void *file_name_)
 int
 process_wait (tid_t child_tid UNUSED)
 {
-  return -1;
+	int i;
+	struct thread *cur = thread_current();
+	
+	for(i = 0; i < 128; i += 1) { // iterate through all processes to find child process
+		if(process_list[i].pid == child_tid) { break; }
+		if(i == 127) { // getting here means invalid tid
+			return -1; 
+		}
+	}
+	
+	if((process_list[i].exception_flag == 1) || (process_list[i].wait_flag == 1) || (process_list[i].parent_pid != cur->tid)) {
+		return -1;
+	}
+	
+	sema_down(&process_list[i].wait_sema);
+	
+	process_list[i].wait_flag = 1;
+	return process_list[i].exit_status;
 }
 
 /* Free the current process's resources. */
@@ -124,6 +282,18 @@ process_exit (void)
       pagedir_activate (NULL);
       pagedir_destroy (pd);
     }
+  
+  if(cur->exit_message_flag) {
+  	printf("%s: exit(%d)\n", cur->name, cur->exit_status);
+  }
+  
+  if(cur->exception_flag == 1) {
+  	process_list[cur->pid_index].exception_flag = 1;
+  }
+  
+  process_list[cur->pid_index].exit_status = cur->exit_status;
+  
+  sema_up(&process_list[cur->pid_index].wait_sema);
 }
 
 /* Sets up the CPU for running user code in the current
@@ -224,6 +394,16 @@ load (const char *file_name, void (**eip) (void), void **esp)
   off_t file_ofs;
   bool success = false;
   int i;
+  
+  /* Initialize flags for wait error condition and exit message */
+  t->exit_message_flag = 1;
+  t->exception_flag = 0;
+  
+  /* Initialize array of open files */
+  for(int i = 0; i < 50; i += 1) {
+  	t->files[i] = 0;
+  }
+  t->next_fd = 2; // first available after STD_OUT and STD_IN
 
   /* Allocate and activate page directory. */
   t->pagedir = pagedir_create ();
@@ -235,7 +415,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
   file = filesys_open (file_name);
   if (file == NULL)
     {
-      printf ("load: %s: open failed\n", file_name);
+      //printf ("load: %s: open failed\n", file_name);
       goto done;
     }
 
@@ -248,7 +428,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
       || ehdr.e_phentsize != sizeof (struct Elf32_Phdr)
       || ehdr.e_phnum > 1024)
     {
-      printf ("load: %s: error loading executable\n", file_name);
+      //printf ("load: %s: error loading executable\n", file_name);
       goto done;
     }
 
@@ -323,6 +503,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
  done:
   /* We arrive here whether the load is successful or not. */
   file_close (file);
+
   return success;
 }
 

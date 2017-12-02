@@ -89,6 +89,9 @@ kill (struct intr_frame *f)
       printf ("%s: dying due to interrupt %#04x (%s).\n",
               thread_name (), f->vec_no, intr_name (f->vec_no));
       intr_dump_frame (f);
+      struct thread *t = thread_current();
+      t->exception_flag = 1;
+      t->exit_status = -1;
       thread_exit ();
 
     case SEL_KCSEG:
