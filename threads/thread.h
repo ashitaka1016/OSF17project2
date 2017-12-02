@@ -4,6 +4,7 @@
 #include <debug.h>
 #include <list.h>
 #include <stdint.h>
+#include "threads/synch.h"
 
 /* States in a thread's life cycle. */
 enum thread_status
@@ -23,6 +24,8 @@ typedef int tid_t;
 #define PRI_MIN 0                       /* Lowest priority. */
 #define PRI_DEFAULT 31                  /* Default priority. */
 #define PRI_MAX 63                      /* Highest priority. */
+
+#define TIME_SLICE 4            /* # of timer ticks to give each thread. */
 
 /* A kernel thread or user process.
 
@@ -92,6 +95,17 @@ struct thread
 
     /* Shared between thread.c and synch.c. */
     struct list_elem elem;              /* List element. */
+    
+    /* List element for waiting_list in timer.c */
+    struct list_elem waiter;
+    
+    struct semaphore timer_sema;
+    int64_t timer_start;
+    int64_t timer_ticks;
+    
+    /* Data members used for mlfqs */
+    int nice;
+    int recent_cpu;
 
 #ifdef USERPROG
     /* Owned by userprog/process.c. */
@@ -130,12 +144,21 @@ void thread_yield (void);
 typedef void thread_action_func (struct thread *t, void *aux);
 void thread_foreach (thread_action_func *, void *);
 
+bool is_idle(struct thread *);
+
 int thread_get_priority (void);
 void thread_set_priority (int);
+int calculate_priority(int, int);
 
 int thread_get_nice (void);
 void thread_set_nice (int);
 int thread_get_recent_cpu (void);
 int thread_get_load_avg (void);
+
+void update_recent_cpu(void);
+void update_load_avg(void);
+void update_priority(void);
+
+bool priority_compare(const struct list_elem *, const struct list_elem *, void *);
 
 #endif /* threads/thread.h */
